@@ -12,6 +12,30 @@ It supports a number of computer vision research projects and production applica
 </div>
 <br>
 
+## Install Guidlines
+
+We highly recommend you to manage the environment.
+
+```bash
+conda install nvidia/label/cuda-12.6.0::cuda-toolkit
+pip3 install torch torchvision torchaudio numpy
+```
+
+Then set the env `TORCH_CUDA_ARCH_LIST` according to your GPU arch.
+
+```bash
+conda env config vars set TORCH_CUDA_ARCH_LIST=<YOUR_GPU_ARCH>
+# for example RTX3090 should run:
+# conda env config vars set TORCH_CUDA_ARCH_LIST="8.6"
+```
+Then you can build the detectron2 package:
+
+```bash
+cd detectron2
+pip3 install -e .
+```
+
+
 ## Learn More about Detectron2
 
 * Includes new capabilities such as panoptic segmentation, Densepose, Cascade R-CNN, rotated bounding boxes, PointRend,
