@@ -1,13 +1,168 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) Facebook, Inc. and its affiliates.
-
+import os
+import copy
 import functools
 import inspect
 import logging
+import importlib
+from pathlib import Path
 from fvcore.common.config import CfgNode as _CfgNode
 
 from detectron2.utils.file_io import PathManager
 
+# Parselib
+import json
+import yaml
+try:
+    import tomllib  # Python ≥ 3.11
+except ModuleNotFoundError:  # pragma: no cover – Python < 3.11 fallback
+    tomllib = None
+from typing import Any, Dict, List, MutableMapping
+
+# Filename extensions for loading configs from files
+_YAML_EXTS = {"", ".yaml", ".yml"}
+_JSON_EXTS = {".json"}
+_TOML_EXTS = {".toml"}
+_PY_EXTS = {".py"}
+_ALL_EXTS = _YAML_EXTS | _JSON_EXTS | _TOML_EXTS | _PY_EXTS
+
+# CfgNodes can only contain a limited set of valid types
+_VALID_TYPES = {tuple, list, str, int, float, bool, type(None)}
+
+# Base key for config files that reference other config files
+BASE_KEY = "_base_"
+RESERVED_KEYS = {BASE_KEY}
+
+
+def _guess_ext(path: os.PathLike | str) -> str:
+    ext = Path(path).suffix.lower()
+    if ext not in _ALL_EXTS:
+        raise ValueError(f'Unsupported config extension "{ext}".  Supported: {_ALL_EXTS}')
+    return ext
+
+
+def _read_raw(path: os.PathLike | str) -> Any:
+    """Return the *raw* Python object encoded in *path* without post‑processing."""
+    ext = _guess_ext(path)
+    if ext in _YAML_EXTS:
+        with open(path, 'r', encoding='utf‑8') as fh:
+            return yaml.safe_load(fh)
+    if ext in _JSON_EXTS:
+        with open(path, 'r', encoding='utf‑8') as fh:
+            return json.load(fh)
+    if ext in _TOML_EXTS:
+        with open(path, 'rb') as fh:  # tomllib expects bytes
+            return tomllib.load(fh)  # type: ignore[arg‑type]
+
+    # Python – exec into an isolated namespace and retrieve "cfg" variable if present,
+    # else gather globals (excluding dunders) as MMEngine does.
+    namespace: dict[str, Any] = {}
+    spec = importlib.util.spec_from_file_location('dynamic_cfg', path)
+    module = importlib.util.module_from_spec(spec)  # type: ignore[arg‑type]
+    assert spec and spec.loader
+    spec.loader.exec_module(module)  # type: ignore[arg‑type]
+
+    if hasattr(module, 'cfg'):
+        data = module.cfg  # conventional single‑variable style
+    else:
+        data = {k: v for k, v in module.__dict__.items() if not k.startswith('__')}
+    
+    return copy.deepcopy(data)
+
+
+def _assert_with_logging(cond, msg):
+    if not cond:
+        print(f"[Detectron2 Config] Assertion failed: {msg}")
+    assert cond, msg
+
+
+def _check_and_coerce_cfg_value_type(replacement, original, key, full_key):
+    """Checks that `replacement`, which is intended to replace `original` is of
+    the right type. The type is correct if it matches exactly or is one of a few
+    cases in which the type can be easily coerced.
+    """
+    original_type = type(original)
+    replacement_type = type(replacement)
+
+    # The types must match (with some exceptions)
+    if replacement_type == original_type:
+        return replacement
+
+    # If either of them is None, allow type conversion to one of the valid types
+    if (replacement_type == type(None) and original_type in _VALID_TYPES) or (
+        original_type == type(None) and replacement_type in _VALID_TYPES
+    ):
+        return replacement
+
+    # Cast replacement from from_type to to_type if the replacement and original
+    # types match from_type and to_type
+    def conditional_cast(from_type, to_type):
+        if replacement_type == from_type and original_type == to_type:
+            return True, to_type(replacement)
+        else:
+            return False, None
+
+    # Conditionally casts
+    # list <-> tuple
+    casts = [(tuple, list), (list, tuple)]
+    # For py2: allow converting from str (bytes) to a unicode string
+    try:
+        casts.append((str, unicode))  # noqa: F821
+    except Exception:
+        pass
+
+    for (from_type, to_type) in casts:
+        converted, converted_value = conditional_cast(from_type, to_type)
+        if converted:
+            return converted_value
+
+    raise ValueError(
+        "Type mismatch ({} vs. {}) with values ({} vs. {}) for config "
+        "key: {}".format(
+            original_type, replacement_type, original, replacement, full_key
+        )
+    )
+
+
+def _merge_a_into_b(a, b, root, key_list):
+    """Merge config dictionary a into config dictionary b, clobbering the
+    options in b whenever they are also specified in a.
+    """
+    _assert_with_logging(
+        isinstance(a, CfgNode),
+        "`a` (cur type {}) must be an instance of {}".format(type(a), CfgNode),
+    )
+    _assert_with_logging(
+        isinstance(b, CfgNode),
+        "`b` (cur type {}) must be an instance of {}".format(type(b), CfgNode),
+    )
+
+    for k, v_ in a.items():
+        full_key = ".".join(key_list + [k])
+
+        v = copy.deepcopy(v_)
+        v = b._decode_cfg_value(v)
+
+        if k in b:
+            v = _check_and_coerce_cfg_value_type(v, b[k], k, full_key)
+            # Recursively merge dicts
+            if isinstance(v, CfgNode):
+                try:
+                    _merge_a_into_b(v, b[k], root, key_list + [k])
+                except BaseException:
+                    raise
+            else:
+                b[k] = v
+        elif b.is_new_allowed():
+            b[k] = v
+        else:
+            if root.key_is_deprecated(full_key):
+                continue
+            elif root.key_is_renamed(full_key):
+                root.raise_key_rename_error(full_key)
+            else:
+                raise KeyError("Non-existent config key: {}".format(full_key))
 
 class CfgNode(_CfgNode):
     """
@@ -32,18 +187,73 @@ class CfgNode(_CfgNode):
     @classmethod
     def _open_cfg(cls, filename):
         return PathManager.open(filename, "r")
+    
+    @classmethod
+    def load_with_base(
+        cls,
+        filename: str | os.PathLike,
+        *,
+        new_allowed: bool = True,
+        _visited: set[str] | None = None,
+    ) -> 'CfgNode':
+        """Load *filename* and recursively merge any `_base_` files it references.
 
-    # Note that the default value of allow_unsafe is changed to True
-    def merge_from_file(self, cfg_filename: str, allow_unsafe: bool = True) -> None:
+        Parameters
+        ----------
+        filename:
+            Path to the configuration file in any supported format.
+        new_allowed:
+            Passed to every nested :class:`CfgNode` to control whether unknown
+            keys are accepted when merging.
+        _visited:
+            Internally used to detect recursive `_base_` loops.
+        """
+        path = os.fspath(filename)
+        _visited = _visited or set()
+        if path in _visited:
+            raise RuntimeError(f'Detected cyclic `_base_` dependency at {path!s}')
+        _visited.add(path)
+
+        raw_obj = _read_raw(path)
+        if raw_obj is None:  # empty file → treat as empty dict
+            raw_obj = {}
+        if not isinstance(raw_obj, MutableMapping):
+            raise TypeError(f'Configuration root of {path!s} must be a mapping, got {type(raw_obj)}')
+
+        # Extract bases
+        base_entry = raw_obj.pop(BASE_KEY, [])
+        base_paths: List[str]
+        if isinstance(base_entry, (list, tuple)):
+            base_paths = list(base_entry)
+        elif base_entry:
+            base_paths = [base_entry]
+        else:
+            base_paths = []
+
+        # Merge order: first loaded bases (left‑to‑right), then current file overwrites
+        merged: CfgNode = cls({}, new_allowed=new_allowed)
+        for rel in base_paths:
+            # allow ~user, env vars and relative paths
+            rel_path = os.path.expanduser(os.path.expandvars(rel))
+            if not os.path.isabs(rel_path):
+                rel_path = os.path.join(os.path.dirname(path), rel_path)
+            child = cls.load_with_base(rel_path, new_allowed=new_allowed, _visited=_visited)
+            _merge_a_into_b(child, merged, merged, [])  # type: ignore[arg‑type]
+
+        current = cls(raw_obj, new_allowed=new_allowed)
+        _merge_a_into_b(current, merged, merged, [])  # type: ignore[arg‑type]
+        return cls(merged, new_allowed=new_allowed)
+
+
+    def merge_from_file(self, cfg_filename: str) -> None:
         """
         Load content from the given config file and merge it into self.
 
         Args:
             cfg_filename: config filename
-            allow_unsafe: allow unsafe yaml syntax
         """
         assert PathManager.isfile(cfg_filename), f"Config file '{cfg_filename}' does not exist!"
-        loaded_cfg = self.load_yaml_with_base(cfg_filename, allow_unsafe=allow_unsafe)
+        loaded_cfg = self.load_with_base(cfg_filename, new_allowed=True)
         loaded_cfg = type(self)(loaded_cfg)
 
         # defaults.py needs to import CfgNode
@@ -91,6 +301,53 @@ class CfgNode(_CfgNode):
         """
         # to make it show up in docs
         return super().dump(*args, **kwargs)
+    
+    def dump_to_file(self, path: os.PathLike | str, *, sort_keys: bool = False):
+        """Serialize this node to *path* (format determined from extension)."""
+        ext = _guess_ext(path)
+        data = self.as_dict()
+        if ext in _YAML_EXTS:
+            yaml.safe_dump(data, open(path, 'w', encoding='utf‑8'), sort_keys=sort_keys)
+        elif ext in _JSON_EXTS:
+            json.dump(data, open(path, 'w', encoding='utf‑8'), indent=2, sort_keys=sort_keys)
+        elif ext in _TOML_EXTS:
+            if not tomllib:
+                raise RuntimeError('tomllib not available – cannot write TOML')
+            import tomli_w  # lightweight dependency
+            tomli_w.dump(data, open(path, 'wb'))  # type: ignore[arg‑type]
+        elif ext in _PY_EXTS:
+            # pretty‑print as valid Python: `key = value` pairs like YACS ‑> YAML
+            text = self._to_python_literal(data)
+            with open(path, 'w', encoding='utf‑8') as fh:
+                fh.write(text)
+        else:  # pragma: no cover – unreachable due to _guess_ext
+            raise AssertionError
+    
+    @staticmethod
+    def _to_python_literal(d: Dict[str, Any], indent: int = 0) -> str:
+        """Very small helper to produce a human‑readable *.py* representation."""
+        ind = ' ' * indent
+        out_lines = []
+        for k, v in sorted(d.items()):
+            if isinstance(v, dict):
+                out_lines.append(f'{ind}{k} = dict(')
+                out_lines.append(CfgNode._to_python_literal(v, indent+4))
+                out_lines.append(f'{ind})')
+            else:
+                out_lines.append(f'{ind}{k} = {repr(v)}')
+        return '\n'.join(out_lines)
+    
+    def as_dict(self) -> Dict[str, Any]:
+        """Return a plain deeply‑copied `dict` without CfgNode wrappers."""
+        def _unwrap(x):
+            if isinstance(x, CfgNode):
+                return {k: _unwrap(v) for k, v in x.items()}
+            if isinstance(x, list):
+                return [_unwrap(e) for e in x]
+            if isinstance(x, tuple):
+                return tuple(_unwrap(e) for e in x)
+            return copy.deepcopy(x)
+        return _unwrap(self)
 
 
 global_cfg = CfgNode()

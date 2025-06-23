@@ -1,14 +1,18 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
+# Modified by: Weiqi Yan
 import atexit
 import functools
 import logging
 import os
 import sys
 import time
+import re
+import pytz
+import datetime
+from rich.logging import RichHandler
 from collections import Counter
 import torch
 from tabulate import tabulate
-from termcolor import colored
 
 from detectron2.utils.file_io import PathManager
 
@@ -18,25 +22,50 @@ D2_LOG_BUFFER_SIZE_KEY: str = "D2_LOG_BUFFER_SIZE"
 
 DEFAULT_LOG_BUFFER_SIZE: int = 1024 * 1024  # 1MB
 
+# DEFAULT FORMAT SETTINGS
+# formats for components of the log record
+FMT = dict(
+    LEVEL=r'[%(levelname)8s]',
+    TIME=r'%(asctime)s',
+    INFO=r'[%(name)s] %(module)s.%(funcName)s%(lineno)4s',
+    MSG=r'%(message)s')
 
-class _ColorfulFormatter(logging.Formatter):
-    def __init__(self, *args, **kwargs):
-        self._root_name = kwargs.pop("root_name") + "."
-        self._abbrev_name = kwargs.pop("abbrev_name", "")
-        if len(self._abbrev_name):
-            self._abbrev_name = self._abbrev_name + "."
-        super(_ColorfulFormatter, self).__init__(*args, **kwargs)
+# record definition for logging in file
+FILE_FMT = ' '.join([fmt for fmt in FMT.values()])
 
-    def formatMessage(self, record):
-        record.name = record.name.replace(self._root_name, self._abbrev_name)
-        log = super(_ColorfulFormatter, self).formatMessage(record)
-        if record.levelno == logging.WARNING:
-            prefix = colored("WARNING", "red", attrs=["blink"])
-        elif record.levelno == logging.ERROR or record.levelno == logging.CRITICAL:
-            prefix = colored("ERROR", "red", attrs=["blink", "underline"])
+# general date/time format
+DATE_FMT = r'%y.%m.%d %H:%M'
+TIME_ZONE = 'UTC'
+
+
+class StreamTimeFormatter:
+    """ Stream time formatter for rich handler """
+    def __init__(self, fmt: str=DATE_FMT, timezone: str=TIME_ZONE):
+        self.fmt = fmt
+        self.timezone = pytz.timezone(timezone) if type(timezone) is str else timezone
+    
+    def __call__(self, *args):
+        shanghai_time = args[0].astimezone(self.timezone)
+        return shanghai_time.strftime(self.fmt)
+
+
+class TagStrippingFormatter(logging.Formatter):
+    """ Custom formatter for stripping tags from the log message(used for file output) """
+    def __init__(self, fmt: str=FMT, datefmt: str=DATE_FMT, style: str='%', validate: bool=True, timezone: str=TIME_ZONE):
+        super().__init__(fmt, datefmt, style, validate)
+        self.tag_pattern = re.compile(r'\[([\w\s]+?)(?: [^\]]*)?\](.*?)\[\/\1\]', re.DOTALL)
+        self.timezone = pytz.timezone(timezone) if type(timezone) is str else timezone
+        
+    def formatTime(self, record, datefmt=DATE_FMT):
+        ct = datetime.fromtimestamp(record.created, self.timezone)
+        if datefmt:
+            return ct.strftime(datefmt)
         else:
-            return log
-        return prefix + " " + log
+            return ct.strftime('%Y-%m-%d %H:%M:%S')
+        
+    def format(self, record):
+        original = super().format(record)
+        return re.sub(self.tag_pattern, r'\2', original)
 
 
 @functools.lru_cache()  # so that calling setup_logger multiple times won't add many handlers
@@ -45,6 +74,9 @@ def setup_logger(
     distributed_rank=0,
     *,
     color=True,
+    timezone=TIME_ZONE,
+    timefmt=DATE_FMT,
+    filefmt=FILE_FMT,
     name="detectron2",
     abbrev_name=None,
     enable_propagation: bool = False,
@@ -81,18 +113,19 @@ def setup_logger(
     )
     # stdout logging: master only
     if configure_stdout and distributed_rank == 0:
-        ch = logging.StreamHandler(stream=sys.stdout)
-        ch.setLevel(logging.DEBUG)
         if color:
-            formatter = _ColorfulFormatter(
-                colored("[%(asctime)s %(name)s]: ", "green") + "%(message)s",
-                datefmt="%m/%d %H:%M:%S",
-                root_name=name,
-                abbrev_name=str(abbrev_name),
+            formatter = StreamTimeFormatter(fmt=timefmt, timezone=timezone)
+            ch = RichHandler(
+                level=logging.DEBUG, 
+                markup=True, 
+                rich_tracebacks=True, 
+                log_time_format=formatter
             )
         else:
+            ch = logging.StreamHandler(stream=sys.stdout)
+            ch.setLevel(logging.DEBUG)
             formatter = plain_formatter
-        ch.setFormatter(formatter)
+            ch.setFormatter(formatter)
         logger.addHandler(ch)
 
     # file logging: all workers
@@ -104,10 +137,10 @@ def setup_logger(
         if distributed_rank > 0:
             filename = filename + ".rank{}".format(distributed_rank)
         PathManager.mkdirs(os.path.dirname(filename))
-
+        
         fh = logging.StreamHandler(_cached_log_stream(filename))
         fh.setLevel(logging.DEBUG)
-        fh.setFormatter(plain_formatter)
+        fh.setFormatter(TagStrippingFormatter(fmt=filefmt, datefmt=timefmt, timezone=timezone))
         logger.addHandler(fh)
 
     return logger
