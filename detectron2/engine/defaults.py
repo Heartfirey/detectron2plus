@@ -45,7 +45,7 @@ from detectron2.utils.file_io import PathManager
 from detectron2.utils.logger import setup_logger
 
 from . import hooks
-from .train_loop import AMPTrainer, SimpleTrainer, TrainerBase
+from .train_loop import AccelerateTrainer, AMPTrainer, SimpleTrainer, TrainerBase
 
 __all__ = [
     "create_ddp_model",
@@ -410,13 +410,44 @@ class DefaultTrainer(TrainerBase):
         model = self.build_model(cfg)
         optimizer = self.build_optimizer(cfg, model)
         data_loader = self.build_train_loader(cfg)
+        
+        # Build lr scheduler before trainer initialization for AccelerateTrainer
+        lr_scheduler = self.build_lr_scheduler(cfg, optimizer)
 
-        model = create_ddp_model(model, broadcast_buffers=False)
-        self._trainer = (AMPTrainer if cfg.SOLVER.AMP.ENABLED else SimpleTrainer)(
-            model, data_loader, optimizer
-        )
+        # Select trainer type and prepare arguments
+        trainer_type = SimpleTrainer
+        trainer_kwargs = {
+            "model": model,
+            "data_loader": data_loader,
+            "optimizer": optimizer,
+        }
+        
+        if cfg.SOLVER.ACCELERATE.ENABLED:
+            trainer_type = AccelerateTrainer
+            # For AccelerateTrainer, don't create DDP model manually
+            # Accelerate will handle distributed training
+            trainer_kwargs.update({
+                "lr_scheduler": lr_scheduler,
+                "accelerate_cfg": {
+                    "mixed_precision": cfg.SOLVER.ACCELERATE.MIXED_PRECISION,
+                    "gradient_accumulation_steps": cfg.SOLVER.ACCELERATE.GRADIENT_ACCUMULATION_STEPS,
+                    "dataloader_config": {
+                        "split_batches": cfg.SOLVER.ACCELERATE.DATALOADER_CONFIG.SPLIT_BATCHES,
+                        "even_batches": cfg.SOLVER.ACCELERATE.DATALOADER_CONFIG.EVEN_BATCHES,
+                    },
+                    **cfg.SOLVER.ACCELERATE.KWARGS,
+                }
+            })
+        else:
+            # For non-Accelerate trainers, create DDP model
+            model = create_ddp_model(model, broadcast_buffers=False)
+            trainer_kwargs["model"] = model
+            
+            if cfg.SOLVER.AMP.ENABLED:
+                trainer_type = AMPTrainer
 
-        self.scheduler = self.build_lr_scheduler(cfg, optimizer)
+        self._trainer = trainer_type(**trainer_kwargs)
+        self.scheduler = lr_scheduler
         self.checkpointer = DetectionCheckpointer(
             # Assume you want to save checkpoints together with logs/statistics
             model,

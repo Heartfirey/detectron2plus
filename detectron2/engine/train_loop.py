@@ -141,6 +141,8 @@ class TrainerBase:
         Args:
             start_iter, max_iter (int): See docs above
         """
+        from detectron2.utils.progress import training_progress
+        
         logger = logging.getLogger(__name__)
         logger.info("Starting training from iteration {}".format(start_iter))
 
@@ -148,21 +150,69 @@ class TrainerBase:
         self.max_iter = max_iter
 
         with EventStorage(start_iter) as self.storage:
-            try:
-                self.before_train()
-                for self.iter in range(start_iter, max_iter):
-                    self.before_step()
-                    self.run_step()
-                    self.after_step()
-                # self.iter == max_iter can be used by `after_train` to
-                # tell whether the training successfully finished or failed
-                # due to exceptions.
-                self.iter += 1
-            except Exception:
-                logger.exception("Exception during training:")
-                raise
-            finally:
-                self.after_train()
+            with training_progress() as progress_manager:
+                # Add main training progress task
+                total_iters = max_iter - start_iter
+                progress_manager.add_task(
+                    "training", 
+                    f"Training ({start_iter}/{max_iter})",
+                    total=total_iters
+                )
+                
+                try:
+                    self.before_train()
+                    for self.iter in range(start_iter, max_iter):
+                        self.before_step()
+                        self.run_step()
+                        self.after_step()
+                        
+                        # Update progress with current metrics
+                        current_metrics = self._get_current_metrics()
+                        progress_manager.update(
+                            "training", 
+                            advance=1,
+                            metrics=current_metrics
+                        )
+                        progress_manager.set_description(
+                            "training", 
+                            f"Training (iter {self.iter + 1}/{max_iter})"
+                        )
+                        
+                    # self.iter == max_iter can be used by `after_train` to
+                    # tell whether the training successfully finished or failed
+                    # due to exceptions.
+                    self.iter += 1
+                except Exception:
+                    logger.exception("Exception during training:")
+                    raise
+                finally:
+                    self.after_train()
+    
+    def _get_current_metrics(self):
+        """Extract current metrics from storage for display in progress bar."""
+        try:
+            from detectron2.utils.events import get_event_storage
+            storage = get_event_storage()
+            
+            # Get the most recent metrics
+            metrics = {}
+            
+            # Common metrics to display
+            metric_keys = ['total_loss', 'loss', 'lr', 'learning_rate', 'data_time']
+            
+            for key in metric_keys:
+                if key in storage._history:
+                    history = storage._history[key]
+                    if history:
+                        latest = history[-1]
+                        if hasattr(latest, 'value'):
+                            metrics[key] = latest.value
+                        else:
+                            metrics[key] = latest
+            
+            return metrics
+        except:
+            return {}
 
     def before_train(self):
         for h in self._hooks:
@@ -469,7 +519,7 @@ class AMPTrainer(SimpleTrainer):
         )
 
         if grad_scaler is None:
-            from torch.cuda.amp import GradScaler
+            from torch.amp import GradScaler
 
             grad_scaler = GradScaler()
         self.grad_scaler = grad_scaler
@@ -482,7 +532,7 @@ class AMPTrainer(SimpleTrainer):
         """
         assert self.model.training, "[AMPTrainer] model was changed to eval mode!"
         assert torch.cuda.is_available(), "[AMPTrainer] CUDA is required for AMP training!"
-        from torch.cuda.amp import autocast
+        from torch.amp import autocast
 
         start = time.perf_counter()
         data = next(self._data_loader_iter)
@@ -528,3 +578,114 @@ class AMPTrainer(SimpleTrainer):
     def load_state_dict(self, state_dict):
         super().load_state_dict(state_dict)
         self.grad_scaler.load_state_dict(state_dict["grad_scaler"])
+
+class AccelerateTrainer(SimpleTrainer):
+    """
+    Like :class:`SimpleTrainer`, but uses HuggingFace Accelerate library
+    for distributed training, mixed precision, and other training optimizations.
+    """
+    
+    def __init__(
+        self,
+        model,
+        data_loader,
+        optimizer,
+        lr_scheduler=None,
+        gather_metric_period=1,
+        zero_grad_before_forward=False,
+        async_write_metrics=False,
+        accelerate_cfg=None,
+    ):
+        """
+        Args:
+            model, data_loader, optimizer, gather_metric_period, zero_grad_before_forward,
+                async_write_metrics: same as in :class:`SimpleTrainer`.
+            lr_scheduler: torch lr scheduler to be prepared by accelerate.
+            accelerate_cfg: dict of accelerate config parameters.
+        """
+        # Initialize without calling super().__init__() to avoid model.train() call
+        TrainerBase.__init__(self)
+        
+        from accelerate import Accelerator
+        
+        if accelerate_cfg is None:
+            accelerate_cfg = {}
+        
+        self.accelerator = Accelerator(**accelerate_cfg)
+        
+        # Prepare model, optimizer, data_loader and lr_scheduler with accelerate
+        if lr_scheduler is not None:
+            self.model, self.optimizer, self.data_loader, self.lr_scheduler = self.accelerator.prepare(
+                model, optimizer, data_loader, lr_scheduler
+            )
+        else:
+            self.model, self.optimizer, self.data_loader = self.accelerator.prepare(
+                model, optimizer, data_loader
+            )
+            self.lr_scheduler = None
+            
+        # Set model to training mode after accelerate preparation
+        self.model.train()
+        
+        # to access the data loader iterator, call `self._data_loader_iter`
+        self._data_loader_iter_obj = None
+        self.gather_metric_period = gather_metric_period
+        self.zero_grad_before_forward = zero_grad_before_forward
+        self.async_write_metrics = async_write_metrics
+        
+        # create a thread pool that can execute non critical logic in run_step asynchronically
+        # use only 1 worker so tasks will be executed in order of submitting.
+        self.concurrent_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        
+    def run_step(self):
+        """
+        Implement the Accelerate training logic.
+        """
+        assert self.model.training, "[AccelerateTrainer] model was changed to eval mode!"
+        start = time.perf_counter()
+        
+        data = next(self._data_loader_iter)
+        data_time = time.perf_counter() - start
+        
+        if self.zero_grad_before_forward:
+            self.optimizer.zero_grad()
+        
+        with self.accelerator.autocast():
+            loss_dict = self.model(data)
+            if isinstance(loss_dict, torch.Tensor):
+                losses = loss_dict
+                loss_dict = {"total_loss": loss_dict}
+            else:
+                losses = sum(loss_dict.values())
+        
+        if not self.zero_grad_before_forward:
+            self.optimizer.zero_grad()
+            
+        self.accelerator.backward(losses)
+        
+        self.after_backward()
+        
+        self.optimizer.step()
+        
+        if self.lr_scheduler is not None:
+            self.lr_scheduler.step()
+
+        if self.async_write_metrics:
+            # write metrics asynchronically
+            self.concurrent_executor.submit(
+                self._write_metrics, loss_dict, data_time, iter=self.iter
+            )
+        else:
+            self._write_metrics(loss_dict, data_time)
+            
+    def state_dict(self):
+        ret = super().state_dict()
+        if self.lr_scheduler is not None:
+            ret["lr_scheduler"] = self.lr_scheduler.state_dict()
+        return ret
+
+    def load_state_dict(self, state_dict):
+        super().load_state_dict(state_dict)
+        if "lr_scheduler" in state_dict and self.lr_scheduler is not None:
+            self.lr_scheduler.load_state_dict(state_dict["lr_scheduler"])
+        

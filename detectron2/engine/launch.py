@@ -1,4 +1,5 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
+import os
 import logging
 from datetime import timedelta
 import torch
@@ -23,6 +24,23 @@ def _find_free_port():
     # NOTE: there is still a chance the port could be taken by other processes.
     return port
 
+def _detect_backend():
+    """
+    Detect whether to use Accelerate or standard PyTorch distributed backend.
+    """
+    # Check if we're being launched by accelerate
+    use_accelerate = (
+        "ACCELERATE_USE_CPU" in os.environ or 
+        "LOCAL_RANK" in os.environ or
+        "ACCELERATE_MIXED_PRECISION" in os.environ or
+        "ACCELERATE_GRADIENT_ACCUMULATION_STEPS" in os.environ
+    )
+    
+    if use_accelerate:
+        return "Accelerate"
+    else:
+        return "Torch"
+
 
 def launch(
     main_func,
@@ -33,6 +51,7 @@ def launch(
     dist_url=None,
     args=(),
     timeout=DEFAULT_TIMEOUT,
+    use_accelerate=None,
 ):
     """
     Launch multi-process or distributed training.
@@ -50,9 +69,29 @@ def launch(
                        Can be set to "auto" to automatically select a free port on localhost
         timeout (timedelta): timeout of the distributed workers
         args (tuple): arguments passed to main_func
+        use_accelerate (bool): whether to use HuggingFace Accelerate for launching.
+                              If None, will auto-detect based on environment variables.
     """
+    # Auto-detect backend if not specified
+    if use_accelerate is None:
+        backend = _detect_backend()
+        use_accelerate = (backend == "Accelerate")
+    
     world_size = num_machines * num_gpus_per_machine
-    if world_size > 1:
+    
+    if use_accelerate:
+        # When using accelerate, we don't handle multi-process spawning ourselves
+        # The user should use `accelerate launch` command
+        logger = logging.getLogger(__name__)
+        if world_size > 1:
+            logger.info(
+                "Accelerate backend detected. Make sure you're using 'accelerate launch' "
+                "command to start training. Detectron2's launch() will not spawn processes."
+            )
+        # Just call the main function directly when using accelerate
+        main_func(*args)
+    elif world_size > 1:
+        # Standard PyTorch distributed training
         # https://github.com/pytorch/pytorch/pull/14391
         # TODO prctl in spawned processes
 

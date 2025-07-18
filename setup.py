@@ -193,6 +193,7 @@ setup(
         # NOTE: When adding new dependencies, if it is required at import time (in addition
         # to runtime), it probably needs to appear in docs/requirements.txt, or as a mock
         # in docs/conf.py
+        "accelerate"
         "rich",
         "pytz",
         "numpy"

@@ -526,7 +526,24 @@ class EvalHook(HookBase):
         self._eval_after_train = eval_after_train
 
     def _do_eval(self):
-        results = self._func()
+        from detectron2.utils.progress import get_progress_manager
+        
+        progress_manager = get_progress_manager()
+        
+        # If we're in a training context, add an evaluation sub-task
+        if progress_manager.is_active():
+            progress_manager.add_task(
+                "evaluation", 
+                "Running evaluation...", 
+                total=None  # Indeterminate progress for evaluation
+            )
+        
+        try:
+            results = self._func()
+        finally:
+            # Remove evaluation task when done
+            if progress_manager.is_active():
+                progress_manager.remove_task("evaluation")
 
         if results:
             assert isinstance(

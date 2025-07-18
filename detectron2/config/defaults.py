@@ -594,6 +594,18 @@ _C.SOLVER.CLIP_GRADIENTS.NORM_TYPE = 2.0
 # To use AMP in inference, run inference under autocast()
 _C.SOLVER.AMP = CN({"ENABLED": False})
 
+# Enable HuggingFace Accelerate for training
+_C.SOLVER.ACCELERATE = CN()
+_C.SOLVER.ACCELERATE.ENABLED = False
+# Accelerate configuration options
+_C.SOLVER.ACCELERATE.MIXED_PRECISION = "no"  # "no", "fp16", "bf16"
+_C.SOLVER.ACCELERATE.GRADIENT_ACCUMULATION_STEPS = 1
+_C.SOLVER.ACCELERATE.DATALOADER_CONFIG = CN()
+_C.SOLVER.ACCELERATE.DATALOADER_CONFIG.SPLIT_BATCHES = False
+_C.SOLVER.ACCELERATE.DATALOADER_CONFIG.EVEN_BATCHES = True
+# Additional accelerate config can be passed via ACCELERATE.KWARGS
+_C.SOLVER.ACCELERATE.KWARGS = CN()
+
 # ---------------------------------------------------------------------------- #
 # Specific test options
 # ---------------------------------------------------------------------------- #
@@ -643,6 +655,21 @@ _C.FLOAT32_PRECISION = ""
 # The period (in terms of steps) for minibatch visualization at train time.
 # Set to 0 to disable.
 _C.VIS_PERIOD = 0
+
+# Rich progress bar configuration
+_C.PROGRESS = CN()
+# Enable Rich progress bars (only shows on main process in multi-GPU training)
+_C.PROGRESS.ENABLED = True
+# Refresh rate for progress bars (updates per second)
+_C.PROGRESS.REFRESH_RATE = 10
+# Whether to show detailed metrics in progress bars
+_C.PROGRESS.SHOW_METRICS = True
+# Style for different phases ("training", "evaluation", "inference", "dataset")
+_C.PROGRESS.STYLES = CN()
+_C.PROGRESS.STYLES.TRAINING = "training"
+_C.PROGRESS.STYLES.EVALUATION = "evaluation"
+_C.PROGRESS.STYLES.INFERENCE = "inference"
+_C.PROGRESS.STYLES.DATASET = "dataset"
 
 # global config is for quick hack purposes.
 # You can set them in command line or config files,

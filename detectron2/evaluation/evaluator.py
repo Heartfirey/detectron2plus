@@ -128,6 +128,8 @@ def inference_on_dataset(
     Returns:
         The return value of `evaluator.evaluate()`
     """
+    from detectron2.utils.progress import get_progress_manager
+    
     num_devices = get_world_size()
     logger = logging.getLogger(__name__)
     logger.info("Start inference on {} batches".format(len(data_loader)))
@@ -140,59 +142,113 @@ def inference_on_dataset(
         evaluator = DatasetEvaluators(evaluator)
     evaluator.reset()
 
+    # Setup progress tracking
+    progress_manager = get_progress_manager()
+    use_existing_progress = progress_manager.is_active()
+    
+    if not use_existing_progress:
+        # Create evaluation progress context if none exists
+        from detectron2.utils.progress import evaluation_progress
+        progress_context = evaluation_progress()
+        progress_context.__enter__()
+    else:
+        progress_context = None
+
+    # Add inference task
+    progress_manager.add_task(
+        "inference",
+        f"Running inference on {total} batches",
+        total=total
+    )
+
     num_warmup = min(5, total - 1)
     start_time = time.perf_counter()
     total_data_time = 0
     total_compute_time = 0
     total_eval_time = 0
-    with ExitStack() as stack:
-        if isinstance(model, nn.Module):
-            stack.enter_context(inference_context(model))
-        stack.enter_context(torch.no_grad())
+    
+    try:
+        with ExitStack() as stack:
+            if isinstance(model, nn.Module):
+                stack.enter_context(inference_context(model))
+            stack.enter_context(torch.no_grad())
 
-        start_data_time = time.perf_counter()
-        dict.get(callbacks or {}, "on_start", lambda: None)()
-        for idx, inputs in enumerate(data_loader):
-            total_data_time += time.perf_counter() - start_data_time
-            if idx == num_warmup:
-                start_time = time.perf_counter()
-                total_data_time = 0
-                total_compute_time = 0
-                total_eval_time = 0
-
-            start_compute_time = time.perf_counter()
-            dict.get(callbacks or {}, "before_inference", lambda: None)()
-            outputs = model(inputs)
-            dict.get(callbacks or {}, "after_inference", lambda: None)()
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            total_compute_time += time.perf_counter() - start_compute_time
-
-            start_eval_time = time.perf_counter()
-            evaluator.process(inputs, outputs)
-            total_eval_time += time.perf_counter() - start_eval_time
-
-            iters_after_start = idx + 1 - num_warmup * int(idx >= num_warmup)
-            data_seconds_per_iter = total_data_time / iters_after_start
-            compute_seconds_per_iter = total_compute_time / iters_after_start
-            eval_seconds_per_iter = total_eval_time / iters_after_start
-            total_seconds_per_iter = (time.perf_counter() - start_time) / iters_after_start
-            if idx >= num_warmup * 2 or compute_seconds_per_iter > 5:
-                eta = datetime.timedelta(seconds=int(total_seconds_per_iter * (total - idx - 1)))
-                log_every_n_seconds(
-                    logging.INFO,
-                    (
-                        f"Inference done {idx + 1}/{total}. "
-                        f"Dataloading: {data_seconds_per_iter:.4f} s/iter. "
-                        f"Inference: {compute_seconds_per_iter:.4f} s/iter. "
-                        f"Eval: {eval_seconds_per_iter:.4f} s/iter. "
-                        f"Total: {total_seconds_per_iter:.4f} s/iter. "
-                        f"ETA={eta}"
-                    ),
-                    n=5,
-                )
             start_data_time = time.perf_counter()
-        dict.get(callbacks or {}, "on_end", lambda: None)()
+            dict.get(callbacks or {}, "on_start", lambda: None)()
+            for idx, inputs in enumerate(data_loader):
+                total_data_time += time.perf_counter() - start_data_time
+                if idx == num_warmup:
+                    start_time = time.perf_counter()
+                    total_data_time = 0
+                    total_compute_time = 0
+                    total_eval_time = 0
+
+                start_compute_time = time.perf_counter()
+                dict.get(callbacks or {}, "before_inference", lambda: None)()
+                outputs = model(inputs)
+                dict.get(callbacks or {}, "after_inference", lambda: None)()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                total_compute_time += time.perf_counter() - start_compute_time
+
+                start_eval_time = time.perf_counter()
+                evaluator.process(inputs, outputs)
+                total_eval_time += time.perf_counter() - start_eval_time
+
+                # Update progress with metrics
+                iters_after_start = idx + 1 - num_warmup * int(idx >= num_warmup)
+                if iters_after_start > 0:
+                    data_seconds_per_iter = total_data_time / iters_after_start
+                    compute_seconds_per_iter = total_compute_time / iters_after_start
+                    eval_seconds_per_iter = total_eval_time / iters_after_start
+                    total_seconds_per_iter = (time.perf_counter() - start_time) / iters_after_start
+                    
+                    progress_metrics = {
+                        "data_time": f"{data_seconds_per_iter:.4f}s",
+                        "compute_time": f"{compute_seconds_per_iter:.4f}s", 
+                        "eval_time": f"{eval_seconds_per_iter:.4f}s"
+                    }
+                    
+                    progress_manager.update(
+                        "inference",
+                        advance=1,
+                        metrics=progress_metrics
+                    )
+                    progress_manager.set_description(
+                        "inference",
+                        f"Inference [{idx+1}/{total}]"
+                    )
+                    
+                    if idx >= num_warmup * 2 or compute_seconds_per_iter > 5:
+                        eta = datetime.timedelta(seconds=int(total_seconds_per_iter * (total - idx - 1)))
+                        log_every_n_seconds(
+                            logging.INFO,
+                            (
+                                f"Inference done {idx + 1}/{total}. "
+                                f"Dataloading: {data_seconds_per_iter:.4f} s/iter. "
+                                f"Inference: {compute_seconds_per_iter:.4f} s/iter. "
+                                f"Eval: {eval_seconds_per_iter:.4f} s/iter. "
+                                f"Total: {total_seconds_per_iter:.4f} s/iter. "
+                                f"ETA={eta}"
+                            ),
+                            n=5,
+                        )
+                else:
+                    # Warmup phase
+                    progress_manager.update("inference", advance=1)
+                    progress_manager.set_description(
+                        "inference", 
+                        f"Warmup [{idx+1}/{total}]"
+                    )
+                start_data_time = time.perf_counter()
+            dict.get(callbacks or {}, "on_end", lambda: None)()
+    
+    finally:
+        # Clean up progress tracking
+        progress_manager.remove_task("inference")
+        
+        if progress_context is not None:
+            progress_context.__exit__(None, None, None)
 
     # Measure the time only for this worker (before the synchronization barrier)
     total_time = time.perf_counter() - start_time

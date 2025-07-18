@@ -1,0 +1,47 @@
+# Example configuration file for using Detectron2 with HuggingFace Accelerate
+# This config extends the base Faster R-CNN config and enables Accelerate features
+
+_BASE_: "Base-RCNN-FPN.yaml"
+
+MODEL:
+  WEIGHTS: "detectron2://ImageNetPretrained/MSRA/R-50.pkl"
+  MASK_ON: False
+  RESNETS:
+    DEPTH: 50
+
+DATASETS:
+  TRAIN: ("coco_2017_train",)
+  TEST: ("coco_2017_val",)
+
+SOLVER:
+  # Standard solver settings
+  IMS_PER_BATCH: 16
+  BASE_LR: 0.001
+  STEPS: (60000, 80000)
+  MAX_ITER: 90000
+  
+  # Enable HuggingFace Accelerate
+  ACCELERATE:
+    ENABLED: True
+    # Mixed precision options: "no", "fp16", "bf16"
+    MIXED_PRECISION: "fp16"
+    # Gradient accumulation for effective larger batch sizes
+    GRADIENT_ACCUMULATION_STEPS: 1
+    
+    # DataLoader configuration
+    DATALOADER_CONFIG:
+      SPLIT_BATCHES: False
+      EVEN_BATCHES: True
+    
+    # Additional accelerate kwargs can be added here
+    KWARGS:
+      # cpu: False  # Set to True for CPU-only training
+      # device_placement: True
+      # log_with: "tensorboard"
+
+# Evaluation settings
+TEST:
+  EVAL_PERIOD: 5000
+
+# Output directory
+OUTPUT_DIR: "./output_accelerate"

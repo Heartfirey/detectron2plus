@@ -191,10 +191,10 @@ class CfgNode(_CfgNode):
     @classmethod
     def load_with_base(
         cls,
-        filename: str | os.PathLike,
+        filename: str,
         *,
         new_allowed: bool = True,
-        _visited: set[str] | None = None,
+        _visited: set = None,
     ) -> 'CfgNode':
         """Load *filename* and recursively merge any `_base_` files it references.
 
@@ -336,18 +336,6 @@ class CfgNode(_CfgNode):
             else:
                 out_lines.append(f'{ind}{k} = {repr(v)}')
         return '\n'.join(out_lines)
-    
-    def as_dict(self) -> Dict[str, Any]:
-        """Return a plain deeply‑copied `dict` without CfgNode wrappers."""
-        def _unwrap(x):
-            if isinstance(x, CfgNode):
-                return {k: _unwrap(v) for k, v in x.items()}
-            if isinstance(x, list):
-                return [_unwrap(e) for e in x]
-            if isinstance(x, tuple):
-                return tuple(_unwrap(e) for e in x)
-            return copy.deepcopy(x)
-        return _unwrap(self)
 
 
 global_cfg = CfgNode()
