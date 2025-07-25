@@ -8,7 +8,7 @@ import sys
 import time
 import re
 import pytz
-import datetime
+from datetime import datetime
 from rich.logging import RichHandler
 from collections import Counter
 import torch
